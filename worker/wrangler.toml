@@ -1,0 +1,15 @@
+name = "slate-reminders"
+main = "index.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+VAPID_PUBLIC = "BMhnLurroKkHNTDZLQVBO7RsPCKQp2WAAJqSM2QPE1gOfQ9L2buCd97hF0O2W4GfKJzIt6Ydvrst3c2fs8o_B0A"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "slate"
+database_id = "ecc322b2-1f37-442a-9290-364bac57f7c8"
