@@ -14,3 +14,10 @@
   Worker; never send titles, clients or gear there.
 - Notification tap → `./#project/<id>/gear` (sw.js notificationclick → app.js route()).
 - Feature ideas and what other apps do: docs/RESEARCH.md.
+- Deleting asks with confirm() and names what goes (header "Delete" on shoot/gear/kit sheets). Noah couldn't find the old hold-to-delete; don't bring it back.
+- Weather + sun (js/weather.js): Open-Meteo geocoding + daily forecast (no key, 16 days ahead), cached on the shoot as
+  `p.wx` (°C, km/h; shown in °F/mph or °C per Settings) so the service worker can add it to reminders. Sun times are
+  computed offline in Core.sunTimes (tested against published tables). Only the place name/coords leave the device.
+- QR labels: vendor/qrcode.js (qrcode-generator 1.4.4, MIT) makes them; label text = https://noahwitchell.github.io/slate/#gear/<id>.
+  js/scanner.js reads them (native BarcodeDetector, else vendored barcode-detector + zxing wasm, same as ~/Claude/Intake).
+  Scan to pack/return ticks and adds pieces on a shoot. Camera is blocked in Claude's browser pane: test scanning on a device.

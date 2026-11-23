@@ -1,7 +1,7 @@
 // Offline cache + reminders. A push arrives empty; this worker reads the shoots the app saved
 // to Cache Storage, works out which reminders are due and writes them itself.
 importScripts('js/core.js');
-const CACHE = 'slate-v1';
+const CACHE = 'slate-v2';
 const DATA = 'slate-data';
 
 self.addEventListener('install', () => self.skipWaiting());

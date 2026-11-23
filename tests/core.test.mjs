@@ -105,3 +105,37 @@ test('exports: CSV and calendar alarms', () => {
   assert.match(cal, /DTEND;VALUE=DATE:20261213/);
   assert.match(cal, /TRIGGER:-PT360M/); // 18:00 the day before = 6 hours before midnight
 });
+
+test('sun times match published tables to a couple of minutes', () => {
+  const near = (ms, iso) => assert.ok(Math.abs(ms - Date.parse(iso)) < 3 * 60000, `${new Date(ms).toISOString()} vs ${iso}`);
+  const la = C.sunTimes('2026-06-21', 34.05, -118.24);
+  near(la.rise, '2026-06-21T12:42:00Z'); // 5:42 AM PDT
+  near(la.set, '2026-06-22T03:08:00Z');  // 8:08 PM PDT
+  const ny = C.sunTimes('2026-12-21', 40.71, -74.0);
+  near(ny.set, '2026-12-21T21:32:00Z');  // 4:32 PM EST
+  assert.equal(C.clock(ny.set, 'America/New_York'), '4:31 PM');
+  assert.equal(C.sunTimes('2026-06-21', 78.2, 15.6).rise, null); // midnight sun
+});
+
+test('forecast parsing, staleness and the reminder weather line', () => {
+  const s = base();
+  const p = s.projects[0];
+  p.place = C.normPlace({ name: 'Austin, Texas', lat: 30.2672, lon: -97.7431, tz: 'America/Chicago' });
+  const now = new Date(2026, 11, 3, 12).getTime();
+  assert.deepEqual(C.needsForecast(s, now).map(x => x.id), ['a']);
+  const days = C.parseForecast({ daily: { time: ['2026-12-10'], weather_code: [61], temperature_2m_max: [20], temperature_2m_min: [10], precipitation_probability_max: [70], wind_speed_10m_max: [20], wind_gusts_10m_max: [50] } });
+  p.wx = { at: now, key: C.wxKey(p), days };
+  assert.deepEqual(C.needsForecast(s, now + 60000), []);
+  assert.equal(C.wxLine(s, p, '2026-12-10'), '🌧️ Rain 68°/50° · 70% rain · gusts 31 mph');
+  s.settings.units = 'C';
+  assert.equal(C.wxLine(s, p, '2026-12-10'), '🌧️ Rain 20°/10° · 70% rain · gusts 50 km/h');
+  p.place = C.normPlace({ name: 'Elsewhere', lat: 1, lon: 1 });
+  assert.equal(C.wxLine(s, p, '2026-12-10'), ''); // moved: old forecast no longer applies
+  assert.equal(C.normalize(JSON.parse(JSON.stringify(s))).projects[0].place.name, 'Elsewhere');
+});
+
+test('scanned codes give back the gear id', () => {
+  assert.equal(C.scannedId(C.labelURL('fx3')), 'fx3');
+  assert.equal(C.scannedId('https://example.com/whatever'), null);
+  assert.equal(C.scannedId('k3x9a1b2'), 'k3x9a1b2');
+});

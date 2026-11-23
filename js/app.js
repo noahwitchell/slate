@@ -1,6 +1,8 @@
 import './core.js';
 import { load, save, mirror, requestPersistence, deliverFile } from './store.js';
 import * as Push from './push.js';
+import * as Weather from './weather.js';
+import { scan } from './scanner.js';
 
 const C = globalThis.Core;
 let S = load();
@@ -24,6 +26,44 @@ const proj = id => S.projects.find(p => p.id === id);
 const item = id => S.gear.find(g => g.id === id);
 const kit = id => S.kits.find(k => k.id === id);
 const money = v => v ? '$' + Number(v).toLocaleString() : '';
+
+// ---------- weather + sun ----------
+
+const sunLine = (p, date) => {
+  if (!p.place) return '';
+  const t = C.sunTimes(date, p.place.lat, p.place.lon);
+  const c = ms => C.clock(ms, p.place.tz);
+  return `<span class="sun"><span>🌅 ${c(t.rise)}</span><span>✨ Golden ${c(t.goldenStart)}</span><span>🌇 ${c(t.set)}</span></span>`;
+};
+// The day a shoot strip talks about: today if it's under way, else its first day.
+const focusDay = p => (p.start <= C.today() && p.end >= C.today() ? C.today() : p.start);
+function wxText(p, date) {
+  const f = C.forecastFor(p, date);
+  if (f) return esc(C.wxLine(S, p, date));
+  const n = C.daysBetween(C.today(), date);
+  if (n >= C.FORECAST_DAYS) return `<span class="muted">Forecast shows up ${C.fmtDate(C.addDays(date, -(C.FORECAST_DAYS - 1)), { noWeekday: true })}</span>`;
+  if (n < 0) return '';
+  return `<span class="muted">${navigator.onLine ? 'Getting forecast…' : 'Forecast needs a connection'}</span>`;
+}
+async function refreshWeather(force) {
+  if (await Weather.refresh(S, force)) { commit(); render(); if (sheetState && sheetState.kind === 'project') renderSheet(); }
+}
+
+// ---------- QR ----------
+
+function qrSVG(text) {
+  const q = window.qrcode(0, 'M');
+  q.addData(text); q.make();
+  return q.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+}
+const labelHTML = g => `<div class="label"><div class="qr">${qrSVG(C.labelURL(g.id))}</div><div><div class="ln">${esc(g.name)}</div><div class="ls">${esc([g.serial && 'SN ' + g.serial, g.category].filter(Boolean).join(' · '))}</div></div></div>`;
+function printLabels(list) {
+  const el = document.getElementById('print');
+  el.innerHTML = list.map(labelHTML).join('');
+  const done = () => { el.innerHTML = ''; removeEventListener('afterprint', done); };
+  addEventListener('afterprint', done);
+  setTimeout(() => window.print(), 50);
+}
 
 // ---------- saving + reminder sync ----------
 
@@ -57,6 +97,7 @@ const I = {
   warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.5v.01"/></svg>',
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>',
   chev: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5 7 7-7 7"/></svg>',
+  qr: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"><rect x="3.5" y="3.5" width="6.5" height="6.5" rx="1.2"/><rect x="14" y="3.5" width="6.5" height="6.5" rx="1.2"/><rect x="3.5" y="14" width="6.5" height="6.5" rx="1.2"/><path d="M14 14h2.5v2.5H14zM18 18h2.5v2.5H18zM14 18.5v2M18.5 14h2" stroke-linecap="round"/></svg>',
   pin: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 21s7-6.2 7-11.5a7 7 0 0 0-14 0C5 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.3"/></svg>',
 };
 
@@ -91,12 +132,14 @@ function shootCard(p, opts = {}) {
   const conf = C.conflicts(S, p).length;
   const meta = [C.fmtRange(p), p.call && `Call ${C.fmtTime(p.call)}`].filter(Boolean).join(' · ');
   const sub = [p.location, p.client].filter(Boolean).join(' · ');
+  const f = C.forecastFor(p, focusDay(p));
+  const chip = f ? `<span class="wx-chip">${C.wxKind(f.code).icon} ${C.temp(f.hi, S.settings.units)}${f.rain >= 30 ? ` · ${Math.round(f.rain)}%` : ''}</span>` : '';
   return `<button class="shoot" data-act="open" data-id="${p.id}" style="--c:${p.color}">
     <span class="stripe ${p.status === 'hold' ? 'hold' : ''}"></span>
     <span class="body">
       <div class="t">${esc(p.title)}</div>
       <div class="m">${esc(meta)}${opts.until ? ` <span class="muted">· ${C.untilText(p.start)}</span>` : ''}</div>
-      ${sub ? `<div class="m2">${esc(sub)}</div>` : ''}
+      ${sub || chip ? `<div class="m2">${chip}${chip && sub ? ' · ' : ''}${esc(sub)}</div>` : ''}
     </span>
     <span class="right">
       ${p.status !== 'confirmed' ? `<span class="tag ${p.status === 'hold' ? 'hold' : ''}">${C.STATUS[p.status].name}</span>` : conf ? `<span class="tag warn">Gear clash</span>` : '<span></span>'}
@@ -264,11 +307,13 @@ function gearView() {
     <div style="margin-top:14px"><button class="btn" data-act="new-kit">${I.plus}New kit</button></div>`;
   const value = S.gear.reduce((a, g) => a + (g.rental ? 0 : g.value * g.qty), 0);
   return `<header class="head"><h1>Gear</h1>
+      <button class="icon-btn" data-act="scan-find" aria-label="Scan a label">${I.qr}</button>
       <div class="seg"><button data-act="gear-view" data-v="items" class="${ui.gearView === 'items' ? 'on' : ''}">Items</button><button data-act="gear-view" data-v="kits" class="${ui.gearView === 'kits' ? 'on' : ''}">Kits</button></div>
       <button class="btn primary small" data-act="${ui.gearView === 'kits' ? 'new-kit' : 'new-gear'}">${I.plus}${ui.gearView === 'kits' ? 'Kit' : 'Gear'}</button></header>
     <div class="scroll"><div style="max-width:860px">
       ${alertsBanner()}
       ${ui.gearView === 'items' ? items : kits}
+      ${ui.gearView === 'items' && S.gear.length ? `<div style="margin-top:16px"><button class="btn" data-act="labels">${I.qr}Print QR labels</button></div>` : ''}
       ${ui.gearView === 'items' && value ? `<p class="hint" style="margin-top:16px">Owned gear value: ${money(value)}. Settings → Export gear list gives an insurance-ready CSV with serials.</p>` : ''}
     </div></div>`;
 }
@@ -325,7 +370,10 @@ function settingsView() {
         <div class="form-h">Calendar</div>
         <div class="form"><div class="field"><span class="lbl">Week starts</span><span class="end"><span class="seg">
           <button data-act="week-start" data-v="0" class="${S.settings.weekStart === 0 ? 'on' : ''}">Sunday</button>
-          <button data-act="week-start" data-v="1" class="${S.settings.weekStart === 1 ? 'on' : ''}">Monday</button></span></span></div></div>
+          <button data-act="week-start" data-v="1" class="${S.settings.weekStart === 1 ? 'on' : ''}">Monday</button></span></span></div>
+          <div class="field"><span class="lbl">Weather in</span><span class="end"><span class="seg">
+          <button data-act="units" data-v="F" class="${S.settings.units === 'F' ? 'on' : ''}">°F, mph</button>
+          <button data-act="units" data-v="C" class="${S.settings.units === 'C' ? 'on' : ''}">°C, km/h</button></span></span></div></div>
         <div class="form-h">Your data</div>
         <div class="form">
           <button class="row" data-act="backup"><span class="grow"><div class="t">Save a backup</div><div class="s">Everything, as one file (Files, AirDrop, Dropbox)</div></span><span class="chev">${I.chev}</span></button>
@@ -341,13 +389,17 @@ function settingsView() {
 
 // ---------- sheets ----------
 
+let scanner = null;
+const stopScan = () => { if (scanner) { scanner.stop(); scanner = null; } };
 function openSheet(state) {
+  stopScan();
   sheetState = state;
   sheet.classList.remove('hidden');
-  sheet.className = 'sheet' + (state.kind === 'project' || state.kind === 'pick' ? ' full' : '') + (state.kind === 'kit' || state.kind === 'gear' ? ' narrow' : '');
+  sheet.className = 'sheet' + (['project', 'pick', 'labels'].includes(state.kind) ? ' full' : '') + (['kit', 'gear', 'place', 'scan'].includes(state.kind) ? ' narrow' : '');
   renderSheet(true);
 }
 function closeSheet() {
+  stopScan();
   const back = sheetState && sheetState.back;
   sheetState = null;
   if (back) return openSheet(back);
@@ -360,7 +412,9 @@ function renderSheet(fresh) {
   const sc = sheetBody.querySelector('.sh-scroll');
   const keep = fresh ? 0 : sc ? sc.scrollTop : 0;
   const k = sheetState.kind;
-  sheetBody.innerHTML = k === 'project' ? projectSheet() : k === 'gear' ? gearSheet() : k === 'kit' ? kitSheet() : k === 'pick' ? pickSheet() : '';
+  sheetBody.innerHTML = k === 'project' ? projectSheet() : k === 'gear' ? gearSheet() : k === 'kit' ? kitSheet() : k === 'pick' ? pickSheet()
+    : k === 'place' ? placeSheet() : k === 'labels' ? labelsSheet() : k === 'scan' ? scanSheet() : '';
+  if (k === 'scan') startScan();
   const sc2 = sheetBody.querySelector('.sh-scroll');
   if (sc2) sc2.scrollTop = keep;
 }
@@ -372,11 +426,14 @@ function projectSheet() {
   if (!p) { setTimeout(closeSheet); return ''; }
   const tab = sheetState.tab || 'gear';
   const pk = C.packing(p);
-  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3></h3><span style="width:72px"></span></div>
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3></h3><button class="btn ghost danger" data-act="p-del">Delete</button></div>
     <div class="p-top" style="border-top:4px solid ${p.color}">
       <input class="t-in" value="${esc(p.title)}" data-pf="title" placeholder="Shoot name" autocomplete="off">
       <div class="meta"><span>${C.fmtRange(p)}</span>${p.call ? `<span>· Call ${C.fmtTime(p.call)}</span>` : ''}<span class="muted">· ${C.untilText(p.start)}</span>
         ${p.status !== 'confirmed' ? `<span class="tag ${p.status === 'hold' ? 'hold' : ''}">${C.STATUS[p.status].name}</span>` : ''}</div>
+      <div class="wx-strip">${p.place
+        ? `<button class="place" data-act="place">${I.pin} ${esc(p.place.name)}</button><span>${wxText(p, focusDay(p))}</span>${sunLine(p, focusDay(p))}`
+        : `<button class="place" data-act="place">${I.pin} Set a place for weather and sun times</button>`}</div>
       <div class="seg"><button data-act="ptab" data-v="gear" class="${tab === 'gear' ? 'on' : ''}">Gear${pk.total ? ` ${pk.done}/${pk.total}` : ''}</button><button data-act="ptab" data-v="details" class="${tab === 'details' ? 'on' : ''}">Details</button></div>
     </div>
     <div class="sh-scroll">${tab === 'gear' ? projectGear(p) : projectDetails(p)}</div>`;
@@ -396,6 +453,13 @@ function projectDetails(p) {
       <div class="field"><span class="lbl">Color</span><span class="end swatches">${C.COLORS.map(c => `<button class="swatch ${p.color === c ? 'on' : ''}" style="--c:${c}" data-act="pcolor" data-v="${c}" aria-label="Color"></button>`).join('')}</span></div>
       <div class="field tall"><label>Notes</label><textarea data-pf="notes" placeholder="Contacts, parking, shot ideas…">${esc(p.notes)}</textarea></div>
     </div>
+    <div class="form-h"><span class="grow">Weather & sun</span>${p.place ? `<button class="btn small" data-act="wx-refresh">Refresh</button>` : ''}</div>
+    <div class="form">
+      <button class="field" data-act="place" style="width:100%;text-align:left"><span class="lbl">Place</span><span style="flex:1;text-align:right;color:${p.place ? 'var(--ink)' : 'var(--muted)'}">${p.place ? esc(p.place.name) : 'Town or city'}</span><span class="chev" style="color:#4d5158">${I.chev}</span></button>
+      ${p.place ? Array.from({ length: Math.min(7, C.daysBetween(p.start, p.end) + 1) }, (_, i) => C.addDays(p.start, i)).map(d => `
+        <div class="wx-day"><span class="d">${C.fmtDate(d, { noWeekday: false })}</span><span>${wxText(p, d) || '<span class="muted">Past</span>'}</span><span class="s">${sunLine(p, d)}</span></div>`).join('') : ''}
+    </div>
+    ${p.place ? `<p class="hint">Times are local to ${esc(p.place.name)}. Golden hour starts when the sun drops below 6°. Forecasts come from Open-Meteo, up to ${C.FORECAST_DAYS} days ahead.</p>` : `<p class="hint">Add the town or city to see sunrise, golden hour and sunset, plus the forecast once the shoot is within ${C.FORECAST_DAYS} days. It also goes into your reminders.</p>`}
     <div class="form-h"><span class="grow">Reminders</span></div>
     <div class="form"><div class="field"><span class="lbl" style="width:auto;flex:1">Use my default reminders</span><button class="toggle ${own ? '' : 'on'}" data-act="p-own-rem" aria-label="Use defaults"></button></div></div>
     ${own ? remEditor(p.reminders, 'p') : `<p class="hint" style="margin-top:-8px">${rems.length ? rems.map(r => `${C.leadText(r.days)} at ${C.fmtTime(r.time)}`).join(' · ') : 'No default reminders set.'} <button class="btn ghost small" data-act="tab" data-tab="settings" style="height:auto;padding:0">Change defaults</button></p>`}
@@ -404,7 +468,7 @@ function projectDetails(p) {
       <button class="btn small" data-act="p-preview">${I.bell}Preview reminder</button>
       <button class="btn small" data-act="p-ics">Add to Calendar</button>
       <button class="btn small" data-act="p-dup">Duplicate</button>
-      <button class="btn small danger hold" data-hold="p-del">Hold to delete</button>
+      <button class="btn small danger" data-act="p-del">Delete shoot</button>
     </div>`;
 }
 
@@ -447,6 +511,7 @@ function projectGear(p) {
     ${clashes.length ? `<div class="banner warn">${I.warn}<span class="grow">${plural(new Set(clashes.map(c => c.item.id)).size, 'tracked piece')} also booked on another shoot these days.</span></div>` : ''}
     <div class="chips" style="margin-bottom:4px">
       <button class="btn primary small" data-act="pick">${I.plus}Add gear</button>
+      <button class="btn small" data-act="scan-pack">${I.qr}Scan</button>
       <button class="btn small" data-act="px-add">${I.plus}Other item</button>
       ${rows.length ? `<button class="btn small" data-act="p-kit">Save as kit</button>` : ''}
       ${done ? `<button class="btn small" data-act="p-reset">Untick all</button>` : ''}
@@ -462,7 +527,7 @@ function gearSheet() {
   if (!g) { setTimeout(closeSheet); return ''; }
   const on = S.projects.filter(p => p.gear.some(x => x.item === g.id)).sort((a, b) => b.start.localeCompare(a.start));
   const w = C.whereIs(S, g);
-  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>${esc(g.name) || 'New gear'}</h3><span style="width:72px"></span></div>
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>${esc(g.name) || 'New gear'}</h3><button class="btn ghost danger" data-act="g-del">Delete</button></div>
     <div class="sh-scroll">
       <div class="form">
         <div class="field"><label>Name</label><input value="${esc(g.name)}" data-gf="name" placeholder="Sony FX3" autocomplete="off"></div>
@@ -482,9 +547,13 @@ function gearSheet() {
         <span class="end"><button class="btn small" data-act="g-toggle-out">${w.state === 'out' ? 'Check in' : 'Mark out'}</button></span></div>
         ${g.log.slice(-6).reverse().map(e => { const p = proj(e.project); return `<div class="field log-row" style="min-height:40px"><span class="muted" style="width:110px">${C.fmtDate(C.ymd(new Date(e.at)), { noWeekday: true })}</span><span>${e.kind === 'out' ? 'Out' : 'In'}${p ? ' · ' + esc(p.title) : ''}${e.note ? ' · ' + esc(e.note) : ''}</span></div>`; }).join('')}
       </div>` : ''}
+      <div class="form-h">Label</div>
+      <div class="form"><div class="field" style="padding:14px;gap:16px;align-items:center"><div class="qr">${qrSVG(C.labelURL(g.id))}</div>
+        <div style="flex:1;font-size:14.5px;color:var(--ink2);line-height:1.45">Stick this on the case. Scan it in Slate to find this piece or tick it off while packing.
+        <div style="margin-top:10px"><button class="btn small" data-act="g-print">Print label</button></div></div></div></div>
       <div class="form-h">Shoots</div>
       ${on.length ? `<div class="list">${on.map(p => `<button class="row" data-act="open-from-gear" data-id="${p.id}"><span class="color-dot" style="--c:${p.color}"></span><span class="grow"><div class="t">${esc(p.title)}</div><div class="s">${C.fmtRange(p)}</div></span><span class="chev">${I.chev}</span></button>`).join('')}</div>` : `<p class="hint" style="margin-top:0">Not on any shoot yet.</p>`}
-      <div style="margin-top:20px"><button class="btn small danger hold" data-hold="g-del">Hold to delete</button></div>
+      <div style="margin-top:20px"><button class="btn small danger" data-act="g-del">Delete this gear</button></div>
     </div>`;
 }
 
@@ -494,12 +563,12 @@ function kitSheet() {
   const k = kit(sheetState.id);
   if (!k) { setTimeout(closeSheet); return ''; }
   const items = k.items.map(item).filter(Boolean);
-  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>Kit</h3><span style="width:72px"></span></div>
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>Kit</h3><button class="btn ghost danger" data-act="kit-del">Delete</button></div>
     <div class="sh-scroll">
       <div class="form"><div class="field"><label>Name</label><input value="${esc(k.name)}" data-kf="name" placeholder="A-cam package" autocomplete="off"></div></div>
       <div class="form-h"><span class="grow">${plural(items.length, 'piece')}</span><button class="btn small" data-act="pick-kit">${I.plus}Add</button></div>
       ${items.length ? `<div class="list">${items.map(g => `<div class="row"><span class="grow"><div class="t">${esc(g.name)}</div><div class="s">${g.category}${g.serial ? ' · SN ' + esc(g.serial) : ''}</div></span><button class="x icon-btn" style="width:32px;height:32px;background:none;color:var(--muted)" data-act="kit-del-item" data-id="${g.id}">${I.x}</button></div>`).join('')}</div>` : `<div class="empty">Add the pieces that travel together.</div>`}
-      <div style="margin-top:20px"><button class="btn small danger hold" data-hold="kit-del">Hold to delete kit</button></div>
+      <div style="margin-top:20px"><button class="btn small danger" data-act="kit-del">Delete kit</button></div>
     </div>`;
 }
 
@@ -533,6 +602,110 @@ function pickRows() {
   }).join('');
   return `${kits ? `<div class="cat-h">Kits</div><div class="list">${kits}</div>` : ''}${groups || (S.gear.length ? '<div class="empty">Nothing matches.</div>' : '')}
     <div style="margin-top:16px"><button class="btn" data-act="pick-new-gear">${I.plus}New gear${q ? ` “${esc(st.q.trim())}”` : ''}</button></div>`;
+}
+
+// ----- place search -----
+
+function placeSheet() {
+  const p = proj(sheetState.id);
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Cancel</button><h3>Place</h3><span style="width:72px"></span></div>
+    <div class="sh-scroll">
+      <div class="search">${I.search}<input id="place-q" type="search" placeholder="Town or city" value="${esc(sheetState.q || '')}" autocomplete="off"></div>
+      <div id="place-rows">${placeRows()}</div>
+      <div class="chips" style="margin-top:14px">
+        <button class="btn small" data-act="place-here">${I.pin}Use where I am now</button>
+        ${p && p.place ? `<button class="btn small danger" data-act="place-clear">Remove place</button>` : ''}
+      </div>
+      <p class="hint" style="margin-top:14px">Only the name you type goes to the weather service (Open-Meteo).</p>
+    </div>`;
+}
+function placeRows() {
+  const st = sheetState;
+  if (st.err) return `<div class="empty">${esc(st.err)}</div>`;
+  if (!st.results) return '';
+  if (!st.results.length) return `<div class="empty">No places found.</div>`;
+  return `<div class="list">${st.results.map((r, i) => `<button class="row" data-act="place-pick" data-i="${i}"><span class="grow"><div class="t">${esc(r.name)}</div><div class="s">${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}${r.tz ? ' · ' + esc(r.tz) : ''}</div></span></button>`).join('')}</div>`;
+}
+let placeT = 0;
+function searchPlaces(q) {
+  clearTimeout(placeT);
+  placeT = setTimeout(async () => {
+    const st = sheetState;
+    if (!st || st.kind !== 'place') return;
+    try { st.err = ''; st.results = q.trim().length < 2 ? null : await Weather.findPlaces(q); }
+    catch { st.err = 'Couldn\'t reach the place search. Check the connection.'; }
+    if (sheetState === st) document.getElementById('place-rows').innerHTML = placeRows();
+  }, 350);
+}
+function setPlace(place) {
+  const p = proj(sheetState.id);
+  p.place = place; p.wx = null;
+  commit(); closeSheet(); render();
+  refreshWeather(true);
+}
+
+// ----- labels -----
+
+function labelsSheet() {
+  const f = sheetState.filter || 'all';
+  const list = S.gear.filter(g => f === 'all' || (f === 'tracked' ? g.tracked : g.category === f)).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+  const cats = C.CATEGORIES.filter(c => S.gear.some(g => g.category === c));
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>QR labels</h3><button class="btn primary small" data-act="labels-print" ${list.length ? '' : 'disabled'}>Print ${list.length}</button></div>
+    <div class="sh-scroll">
+      <div class="chips" style="margin-bottom:14px">${[['all', 'All'], ['tracked', 'Tracked'], ...cats.map(c => [c, c])].map(([k, l]) => `<button class="chip ${f === k ? 'on' : ''}" data-act="labels-filter" data-v="${k}">${l}</button>`).join('')}</div>
+      <p class="hint" style="margin:0 4px 14px">Prints three across on letter paper, about an inch square each. Cut them out and tape them to cases, or print on sticker sheets.</p>
+      <div class="label-grid">${list.map(labelHTML).join('')}</div>
+    </div>`;
+}
+
+// ----- scanner -----
+
+function scanSheet() {
+  const st = sheetState;
+  const p = st.target === 'project' ? proj(st.id) : null;
+  const title = p ? `${st.mode === 'return' ? 'Wrap check' : 'Pack'}: ${p.title}` : 'Scan a label';
+  return `<div class="sh-head"><button class="btn ghost" data-act="close">Done</button><h3>${esc(title)}</h3><span style="width:72px"></span></div>
+    <div class="sh-scroll">
+      <div class="scan-box" id="scan-box"><video id="scan-video" playsinline muted></video><div class="frame"></div></div>
+      <div class="scan-status" id="scan-status">Starting camera…</div>
+      <div id="scan-log">${scanLog()}</div>
+    </div>`;
+}
+function scanLog() {
+  const log = sheetState.log || [];
+  if (!log.length) return sheetState.target === 'project' ? `<p class="hint" style="margin:0 4px">Each label you scan gets ticked ${sheetState.mode === 'return' ? 'as back' : 'as packed'}. Pieces not on the list are added.</p>` : '';
+  return `<div class="list">${log.slice().reverse().map(e => `<div class="row"><span class="check ${e.ok ? 'on' : ''}">${I.tick}</span><span class="grow"><div class="t">${esc(e.name)}</div><div class="s">${esc(e.msg)}</div></span></div>`).join('')}</div>`;
+}
+function startScan() {
+  const st = sheetState;
+  const video = document.getElementById('scan-video');
+  const status = document.getElementById('scan-status');
+  scanner = scan(video, code => onScan(st, code), { onStatus: m => { if (status) status.textContent = m; } });
+  scanner.ready.catch(e => { if (sheetState === st) status.textContent = /denied|NotAllowed/i.test(String(e && (e.name || e.message))) ? 'Camera access wasn\'t allowed. Turn it on in Settings → Slate (or Safari) → Camera.' : (e && e.message) || 'The camera couldn\'t start.'; });
+}
+function onScan(st, code) {
+  if (sheetState !== st) return;
+  const id = C.scannedId(code);
+  const it = id && item(id);
+  const box = document.getElementById('scan-box');
+  if (!it) { toast('That isn\'t a Slate label for gear on this device'); return; }
+  box.classList.add('hit'); setTimeout(() => box.classList.remove('hit'), 450);
+  if (st.target !== 'project') { openSheet({ kind: 'gear', id: it.id }); return; }
+  const p = proj(st.id);
+  const key = st.mode === 'return' ? 'returned' : 'packed';
+  let g = p.gear.find(x => x.item === it.id), msg;
+  if (!g) { g = { item: it.id, qty: 1, packed: false, returned: false }; p.gear.push(g); msg = 'Added to the list'; }
+  if (g[key]) msg = msg || (st.mode === 'return' ? 'Already back' : 'Already packed');
+  else {
+    g[key] = true;
+    logTracked(it, st.mode === 'return' ? 'in' : 'out', p);
+    msg = (msg ? msg + ' and ' : '') + (st.mode === 'return' ? 'checked back in' : 'packed');
+  }
+  const pk = p.gear.filter(x => x[key]).length;
+  (st.log = st.log || []).push({ name: it.name, msg: `${msg[0].toUpperCase() + msg.slice(1)} · ${pk} of ${p.gear.length}`, ok: true });
+  commit(); render();
+  document.getElementById('scan-log').innerHTML = scanLog();
+  toast(`${it.name}: ${msg}`);
 }
 
 // ---------- actions ----------
@@ -594,7 +767,7 @@ const ACT = {
   month: el => { ui.m += +el.dataset.d; if (ui.m < 0) { ui.m = 11; ui.y--; } if (ui.m > 11) { ui.m = 0; ui.y++; } render(); },
   today: () => { selectDate(C.today()); render(); },
   new: () => newShoot(),
-  open: el => openSheet({ kind: 'project', id: el.dataset.id, tab: 'gear' }),
+  open: el => { openSheet({ kind: 'project', id: el.dataset.id, tab: 'gear' }); refreshWeather(); },
   'open-from-gear': el => openSheet({ kind: 'project', id: el.dataset.id, tab: 'gear', back: { ...sheetState } }),
   close: () => closeSheet(),
   'shoots-seg': el => { ui.shoots = el.dataset.v; render(); },
@@ -604,6 +777,18 @@ const ACT = {
   'open-gear': el => openSheet({ kind: 'gear', id: el.dataset.id }),
   'new-kit': () => { const k = { id: C.uid(), name: '', items: [] }; S.kits.push(k); commit(); ui.gearView = 'kits'; render(); openSheet({ kind: 'kit', id: k.id }); setTimeout(() => sheetBody.querySelector('[data-kf=name]')?.focus(), 50); },
   'open-kit': el => openSheet({ kind: 'kit', id: el.dataset.id }),
+  units: el => { S.settings.units = el.dataset.v; commit(); render(); },
+  place: () => openSheet({ kind: 'place', id: sheetState.id, q: '', back: { ...sheetState } }),
+  'place-pick': el => setPlace(sheetState.results[+el.dataset.i]),
+  'place-here': async () => { try { setPlace(await Weather.here()); } catch (e) { toast(e.message); } },
+  'place-clear': () => setPlace(null),
+  'wx-refresh': () => { if (!navigator.onLine) return toast('No connection'); refreshWeather(true); toast('Updating forecast'); },
+  'g-print': () => printLabels([item(sheetState.id)]),
+  labels: () => openSheet({ kind: 'labels', filter: 'all' }),
+  'labels-filter': el => { sheetState.filter = el.dataset.v; renderSheet(); },
+  'labels-print': () => { const f = sheetState.filter; printLabels(S.gear.filter(g => f === 'all' || (f === 'tracked' ? g.tracked : g.category === f)).sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name))); },
+  'scan-find': () => openSheet({ kind: 'scan', target: 'find' }),
+  'scan-pack': () => { const p = proj(sheetState.id); openSheet({ kind: 'scan', target: 'project', id: p.id, mode: sheetState.mode || (p.end < C.today() || p.status === 'wrapped' ? 'return' : 'pack'), back: { ...sheetState } }); },
   'week-start': el => { S.settings.weekStart = +el.dataset.v; commit(); render(); },
 
   // reminders
@@ -704,20 +889,34 @@ const ACT = {
   backup: () => deliverFile(`Slate backup ${C.today()}.json`, JSON.stringify(S, null, 1), 'application/json'),
   'export-csv': () => deliverFile(`Slate gear list ${C.today()}.csv`, C.gearCSV(S), 'text/csv'),
   'export-ics': () => { const list = C.upcoming(S); if (!list.length) return toast('No upcoming shoots'); deliverFile('Slate shoots.ics', C.ics(S, list), 'text/calendar'); },
-  sample: () => { S = C.normalize(sample()); commit(); ui.tab = 'cal'; render(); toast('Example data loaded'); },
+  sample: () => { S = C.normalize(sample()); commit(); ui.tab = 'cal'; render(); toast('Example data loaded'); refreshWeather(); },
 };
 
-const HOLD = {
-  'p-del': () => { S.projects = S.projects.filter(p => p.id !== sheetState.id); commit(); sheetState.back = null; closeSheet(); toast('Shoot deleted'); },
+// Removing data asks first; the question names what goes.
+const DEL = {
+  'p-del': () => {
+    const p = proj(sheetState.id);
+    if (!confirm(`Delete “${p.title || 'Untitled shoot'}” (${C.fmtRange(p)})?\n\nIts gear list and reminders go too. This can't be undone.`)) return;
+    S.projects = S.projects.filter(x => x.id !== p.id);
+    S.gear.forEach(g => { g.log = g.log.filter(e => e.project !== p.id); });
+    commit(); sheetState.back = null; closeSheet(); toast('Shoot deleted');
+  },
   'g-del': () => {
-    const id = sheetState.id;
-    S.gear = S.gear.filter(g => g.id !== id);
-    S.projects.forEach(p => { p.gear = p.gear.filter(g => g.item !== id); });
-    S.kits.forEach(k => { k.items = k.items.filter(x => x !== id); });
+    const g = item(sheetState.id);
+    const used = S.projects.filter(p => p.gear.some(x => x.item === g.id)).length;
+    if (!confirm(`Delete “${g.name || 'this gear'}”?${used ? `\n\nIt comes off ${plural(used, 'shoot')} and any kits.` : ''} This can't be undone.`)) return;
+    S.gear = S.gear.filter(x => x.id !== g.id);
+    S.projects.forEach(p => { p.gear = p.gear.filter(x => x.item !== g.id); });
+    S.kits.forEach(k => { k.items = k.items.filter(x => x !== g.id); });
     commit(); closeSheet(); toast('Gear deleted');
   },
-  'kit-del': () => { S.kits = S.kits.filter(k => k.id !== sheetState.id); commit(); closeSheet(); toast('Kit deleted'); },
+  'kit-del': () => {
+    const k = kit(sheetState.id);
+    if (!confirm(`Delete the kit “${k.name || 'Kit'}”?\n\nThe gear in it stays.`)) return;
+    S.kits = S.kits.filter(x => x.id !== k.id); commit(); closeSheet(); toast('Kit deleted');
+  },
 };
+Object.assign(ACT, DEL);
 
 // ---------- events ----------
 
@@ -729,23 +928,11 @@ document.addEventListener('click', e => {
 });
 sheet.addEventListener('click', e => { if (e.target === sheet) closeSheet(); });
 
-// Hold-to-confirm for anything that removes data.
-let holdT = null;
-document.addEventListener('pointerdown', e => {
-  const el = e.target.closest('[data-hold]');
-  if (!el) return;
-  el.classList.add('holding');
-  holdT = setTimeout(() => { el.classList.remove('holding'); HOLD[el.dataset.hold]?.(); }, 800);
-});
-const cancelHold = () => { clearTimeout(holdT); document.querySelectorAll('.holding').forEach(x => x.classList.remove('holding')); };
-document.addEventListener('pointerup', cancelHold);
-document.addEventListener('pointercancel', cancelHold);
-document.addEventListener('click', e => { if (e.target.closest('[data-hold]') && !e.target.closest('.holding')) toast('Press and hold to delete'); });
-
 // Typing: save as you go; re-render only what doesn't hold focus.
 document.addEventListener('input', e => {
   const el = e.target;
   if (el.id === 'gear-q') { ui.gearQ = el.value; document.getElementById('gear-rows').innerHTML = gearRows(); return; }
+  if (el.id === 'place-q') { sheetState.q = el.value; searchPlaces(el.value); return; }
   if (el.id === 'pick-q') { sheetState.q = el.value; document.getElementById('pick-rows').innerHTML = pickRows(); return; }
   const text = el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && !['date', 'time', 'number'].includes(el.type));
   if (!text) return;
@@ -797,6 +984,8 @@ async function restore(input) {
 
 // Deep links (from a reminder): #project/<id>/gear
 function route() {
+  const gm = /^#gear\/([A-Za-z0-9_-]+)/.exec(location.hash);
+  if (gm) { history.replaceState(null, '', location.pathname + location.search); if (item(gm[1])) { ui.tab = 'gear'; render(); openSheet({ kind: 'gear', id: gm[1] }); } return; }
   const m = /^#project\/([^/]+)(?:\/(gear|details))?/.exec(location.hash);
   if (!m) return;
   history.replaceState(null, '', location.pathname + location.search);
@@ -821,7 +1010,8 @@ document.addEventListener('visibilitychange', async () => {
   S = load();
   ui.push = await Push.status();
   if (ui.push.state === 'on') Push.sync(S).catch(() => {});
-  if (sheetState) renderSheet(); render();
+  if (sheetState && sheetState.kind !== 'scan') renderSheet(); render();
+  refreshWeather();
 });
 
 // ---------- example data ----------
@@ -829,6 +1019,8 @@ document.addEventListener('visibilitychange', async () => {
 function sample() {
   const t = C.today();
   const g = (id, name, category, more = {}) => ({ id, name, category, ...more });
+  const la = { name: 'Los Angeles, California', lat: 34.0522, lon: -118.2437, tz: 'America/Los_Angeles' };
+  const oj = { name: 'Ojai, California', lat: 34.448, lon: -119.2429, tz: 'America/Los_Angeles' };
   return {
     gear: [
       g('fx3', 'Sony FX3', 'Camera', { serial: '5012345', tracked: true, value: 3900 }),
@@ -857,11 +1049,11 @@ function sample() {
       { id: 'kL', name: 'Small lighting kit', items: ['600x', 'tubes', 'cstand', 'vmount'] },
     ],
     projects: [
-      { id: 'p1', title: 'Coffee brand spot', client: 'Northside Roasters', location: 'Studio B, 4th St', start: C.addDays(t, 1), end: C.addDays(t, 2), call: '07:00', color: C.COLORS[0],
+      { id: 'p1', title: 'Coffee brand spot', client: 'Northside Roasters', location: 'Studio B, 4th St', start: C.addDays(t, 1), end: C.addDays(t, 2), call: '07:00', color: C.COLORS[0], place: la,
         gear: ['fx3', '2470', '35', 'fz100', 'cfa', 'ninja', '600x', 'tubes', 'cstand', 'tripod', 'wl'].map((item, i) => ({ item, packed: i < 5, qty: item === 'fz100' ? 6 : item === 'cfa' ? 3 : item === 'tubes' ? 4 : 1 })), extras: [{ name: 'Gaff tape', packed: true }, { name: 'Sandbags x4' }] },
-      { id: 'p2', title: 'Founder interview', client: 'Brightline', location: 'Client office', start: C.addDays(t, 2), call: '09:30', color: C.COLORS[4],
+      { id: 'p2', title: 'Founder interview', client: 'Brightline', location: 'Client office', start: C.addDays(t, 2), call: '09:30', color: C.COLORS[4], place: la,
         gear: ['a7s', '85', 'wl', 'ntg', 'tripod'].map(item => ({ item })) },
-      { id: 'p3', title: 'Wedding — Rivera', location: 'Old Mill Barn', start: C.addDays(t, 9), call: '13:00', color: C.COLORS[6], status: 'confirmed',
+      { id: 'p3', title: 'Wedding — Rivera', location: 'Old Mill Barn', start: C.addDays(t, 9), call: '13:00', color: C.COLORS[6], place: oj, status: 'confirmed',
         gear: ['fx3', 'a7s', 'ronin', '35', '85', 'fz100', 'cfa'].map(item => ({ item })), reminders: [{ days: 14, time: '09:00', note: 'Send timeline to couple' }, { days: 3, time: '09:00', note: 'Clean sensors' }, { days: 1, time: '17:00', note: 'Charge everything' }] },
       { id: 'p4', title: 'Music video (hold)', client: 'Low Tide', start: C.addDays(t, 15), end: C.addDays(t, 17), color: C.COLORS[5], status: 'hold' },
       { id: 'p5', title: 'Product stills', client: 'Pace Running', location: 'Home studio', start: C.addDays(t, -5), color: C.COLORS[2], status: 'wrapped',
@@ -881,3 +1073,4 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 mirror(S);
 Push.status().then(st => { ui.push = st; if (st.state === 'on') Push.sync(S).catch(() => {}); if (ui.tab === 'settings') render(); });
 route();
+refreshWeather();

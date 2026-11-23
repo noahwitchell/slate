@@ -79,7 +79,7 @@
 
   // ---------- shape ----------
 
-  const emptyState = () => ({ v: 1, projects: [], gear: [], kits: [], settings: { reminders: DEFAULT_REMINDERS.map(r => ({ ...r })), weekStart: 0 } });
+  const emptyState = () => ({ v: 1, projects: [], gear: [], kits: [], settings: { reminders: DEFAULT_REMINDERS.map(r => ({ ...r })), weekStart: 0, units: 'F' } });
 
   const str = (v, max = 500) => (typeof v === 'string' ? v.slice(0, max) : '');
   const num = (v, lo, hi, d) => (Number.isFinite(+v) && v !== '' && v !== null ? Math.min(hi, Math.max(lo, Math.round(+v))) : d);
@@ -117,7 +117,29 @@
         id: str(x.id, 40) || uid(), name: str(x.name, 120), qty: num(x.qty, 1, 999, 1), packed: !!x.packed,
       })),
       created: num(p.created, 0, 1e15, 0),
+      place: normPlace(p.place),
+      wx: normWx(p.wx),
     };
+  }
+
+  // Where a shoot is, for weather and sun: { name, lat, lon, tz } or null.
+  function normPlace(pl) {
+    if (!pl || !Number.isFinite(+pl.lat) || !Number.isFinite(+pl.lon) || Math.abs(pl.lat) > 90 || Math.abs(pl.lon) > 180) return null;
+    let tz = str(pl.tz, 64);
+    try { new Intl.DateTimeFormat('en', { timeZone: tz || undefined }); } catch { tz = ''; }
+    return { name: str(pl.name, 120) || 'Pinned place', lat: +(+pl.lat).toFixed(4), lon: +(+pl.lon).toFixed(4), tz };
+  }
+
+  // Last forecast fetched for a shoot: { at, key, days: { date: { hi, lo, rain, code, wind, gust } } } (°C, km/h).
+  function normWx(w) {
+    if (!w || typeof w !== 'object' || !w.days || typeof w.days !== 'object') return null;
+    const days = {};
+    for (const [d, v] of Object.entries(w.days)) {
+      if (!validDate(d) || !v) continue;
+      const n = x => (Number.isFinite(+x) && x !== null ? Math.round(+x * 10) / 10 : null);
+      days[d] = { hi: n(v.hi), lo: n(v.lo), rain: n(v.rain), code: n(v.code), wind: n(v.wind), gust: n(v.gust) };
+    }
+    return { at: num(w.at, 0, 1e15, 0), key: str(w.key, 80), days };
   }
 
   function normGear(g) {
@@ -156,7 +178,7 @@
     const st = s.settings || {};
     return {
       v: 1, projects, gear, kits,
-      settings: { reminders: normReminders(st.reminders) || base.settings.reminders, weekStart: st.weekStart === 1 ? 1 : 0 },
+      settings: { reminders: normReminders(st.reminders) || base.settings.reminders, weekStart: st.weekStart === 1 ? 1 : 0, units: st.units === 'C' ? 'C' : 'F' },
     };
   }
 
@@ -258,13 +280,15 @@
     return out.sort((a, b) => a.at - b.at);
   }
 
-  function notice(s, p, days, note) {
+  function notice(s, p, days, note, now = Date.now()) {
     const pk = packing(p);
     const when = days === 0 ? 'Today' : days === 1 ? 'Tomorrow' : `In ${days} days`;
     const call = p.call ? ` · call ${fmtTime(p.call)}` : '';
     const bits = [`${fmtRange(p)}${call}`];
     if (note) bits.unshift(note);
     if (p.location) bits.push(p.location);
+    const w = wxLine(s, p, p.start, now);
+    if (w) bits.push(w);
     bits.push(pk.total ? `${pk.done} of ${pk.total} packed. Tap for the gear list.` : 'No gear list yet. Tap to build one.');
     return { title: `${when}: ${p.title}`, body: bits.join('\n'), url: `./#project/${p.id}/gear` };
   }
@@ -311,6 +335,98 @@
     return lines.join('\r\n');
   }
 
+
+  // ---------- sun ----------
+
+  const RAD = Math.PI / 180;
+  // Sun events for a date at a place, as epoch ms (null when the sun never crosses that angle).
+  // Standard sunrise equation; good to about a minute.
+  function sunTimes(date, lat, lon) {
+    const [y, m, d] = ymdParts(date);
+    const n = Math.round(Date.UTC(y, m, d, 12) / DAY + 2440587.5 - 2451545.0);
+    const Jstar = n - lon / 360;
+    const M = (357.5291 + 0.98560028 * Jstar) % 360;
+    const Cc = 1.9148 * Math.sin(M * RAD) + 0.02 * Math.sin(2 * M * RAD) + 0.0003 * Math.sin(3 * M * RAD);
+    const L = (M + Cc + 180 + 102.9372) % 360;
+    const Jtransit = 2451545.0 + Jstar + 0.0053 * Math.sin(M * RAD) - 0.0069 * Math.sin(2 * L * RAD);
+    const dec = Math.asin(Math.sin(L * RAD) * Math.sin(23.4397 * RAD));
+    const toMs = J => Math.round((J - 2440587.5) * DAY);
+    const pair = h => {
+      const c = (Math.sin(h * RAD) - Math.sin(lat * RAD) * Math.sin(dec)) / (Math.cos(lat * RAD) * Math.cos(dec));
+      if (c < -1 || c > 1) return [null, null];
+      const w = Math.acos(c) / RAD / 360;
+      return [toMs(Jtransit - w), toMs(Jtransit + w)];
+    };
+    const [rise, set] = pair(-0.833);
+    const [dawn, dusk] = pair(-6);
+    const [goldenEnd, goldenStart] = pair(6); // morning golden hour ends / evening one starts
+    return { dawn, rise, goldenEnd, noon: toMs(Jtransit), goldenStart, set, dusk };
+  }
+
+  // A clock time in a time zone ('' = this device's), like "4:52 PM".
+  function clock(ms, tz) {
+    if (ms === null || ms === undefined) return '—';
+    try { return new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz || undefined }).format(new Date(ms)); }
+    catch { return new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(new Date(ms)); }
+  }
+
+  // ---------- weather ----------
+
+  const WX = [
+    [[0], '☀️', 'Clear'], [[1], '🌤️', 'Mostly clear'], [[2], '⛅', 'Partly cloudy'], [[3], '☁️', 'Overcast'],
+    [[45, 48], '🌫️', 'Fog'], [[51, 53, 55, 56, 57], '🌦️', 'Drizzle'], [[61, 63, 66], '🌧️', 'Rain'], [[65, 67], '🌧️', 'Heavy rain'],
+    [[71, 73, 75, 77], '🌨️', 'Snow'], [[80, 81, 82], '🌦️', 'Showers'], [[85, 86], '🌨️', 'Snow showers'], [[95, 96, 99], '⛈️', 'Thunderstorms'],
+  ];
+  function wxKind(code) { const k = WX.find(w => w[0].includes(code)); return k ? { icon: k[1], name: k[2] } : { icon: '🌡️', name: 'Forecast' }; }
+  const FORECAST_DAYS = 16;
+
+  const temp = (c, units) => (c === null ? '–' : Math.round(units === 'C' ? c : c * 9 / 5 + 32) + '°');
+  const speed = (k, units) => (k === null ? '–' : units === 'C' ? `${Math.round(k)} km/h` : `${Math.round(k / 1.609)} mph`);
+
+  // Open-Meteo daily response → { date: {...} }.
+  function parseForecast(j) {
+    const d = j && j.daily;
+    if (!d || !Array.isArray(d.time)) throw new Error('no forecast');
+    const days = {};
+    d.time.forEach((t, i) => {
+      const g = k => (d[k] ? d[k][i] : null);
+      days[t] = { hi: g('temperature_2m_max'), lo: g('temperature_2m_min'), rain: g('precipitation_probability_max'), code: g('weather_code'), wind: g('wind_speed_10m_max'), gust: g('wind_gusts_10m_max') };
+    });
+    return days;
+  }
+
+  // Which shoots need a fresh forecast: upcoming, placed, within forecast range, older than maxAge.
+  function needsForecast(s, now = Date.now(), maxAge = 2 * 3600000) {
+    const t = today(now);
+    return s.projects.filter(p => live(p) && p.place && p.end >= t && daysBetween(t, p.start) < FORECAST_DAYS
+      && (!p.wx || p.wx.key !== wxKey(p) || now - p.wx.at > maxAge));
+  }
+  const wxKey = p => (p.place ? `${p.place.lat},${p.place.lon}` : '');
+  function forecastFor(p, date) {
+    return p.wx && p.wx.key === wxKey(p) ? p.wx.days[date] || null : null;
+  }
+  function wxLine(s, p, date, now = Date.now()) {
+    const f = forecastFor(p, date);
+    if (!f) return '';
+    const k = wxKind(f.code);
+    const u = s.settings.units;
+    const bits = [`${k.icon} ${k.name} ${temp(f.hi, u)}/${temp(f.lo, u)}`];
+    if (f.rain !== null) bits.push(`${Math.round(f.rain)}% rain`);
+    if (f.gust !== null && f.gust >= 40) bits.push(`gusts ${speed(f.gust, u)}`);
+    return bits.join(' · ');
+  }
+
+  // ---------- QR labels ----------
+
+  const LABEL_BASE = 'https://noahwitchell.github.io/slate/#gear/';
+  const labelURL = id => LABEL_BASE + id;
+  // Reads a gear id from a scanned code: our label URL, or a bare id.
+  function scannedId(text) {
+    const m = /#gear\/([A-Za-z0-9_-]{1,40})\s*$/.exec(String(text || '').trim());
+    if (m) return m[1];
+    return /^[A-Za-z0-9_-]{3,40}$/.test(String(text || '').trim()) ? String(text).trim() : null;
+  }
+
   G.Core = {
     DAY, CATEGORIES, STATUS, COLORS, CONDITION, DEFAULT_REMINDERS, MONTHS, WEEKDAYS,
     uid, ymd, parse, addDays, today, daysBetween, at, validDate, validTime,
@@ -318,5 +434,7 @@
     emptyState, normalize, normProject, normGear, normReminders,
     onDate, upcoming, past, remindersFor, monthGrid, weekBars, packing, conflicts, whereIs, rentalsDue,
     schedule, due, notice, fallbackNotice, gearCSV, ics,
+    normPlace, sunTimes, clock, wxKind, temp, speed, parseForecast, needsForecast, forecastFor, wxLine, wxKey, FORECAST_DAYS,
+    labelURL, scannedId,
   };
 })(globalThis);

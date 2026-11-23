@@ -13,6 +13,9 @@ Live at https://noahwitchell.github.io/slate/ (Share → Add to Home Screen).
 - **Tracked gear**: mark key pieces as tracked to see whether they're in or out, keep a check-out history, and get a
   warning when one is booked on two overlapping shoots.
 - **Rentals**: rental house and return date, with a banner when one is due or overdue.
+- **Weather & sun**: set a town or city on a shoot to see sunrise, golden hour and sunset for each day, plus the
+  Open-Meteo forecast once it's within 16 days (also added to reminders).
+- **QR labels**: print labels for your gear; scan one to open that piece, or scan while packing / at wrap to tick it off.
 - **Exports**: full JSON backup/restore, insurance CSV (serials, values), .ics for the iPad's Calendar.
 
 Data stays on the device (localStorage, mirrored to Cache Storage for the service worker).
